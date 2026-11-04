@@ -1,13 +1,17 @@
 package browser
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
+	homedir "github.com/mitchellh/go-homedir"
 	"github.com/playwright-community/playwright-go"
 	"github.com/sirupsen/logrus"
 	"github.com/versent/saml2aws/v2/pkg/cfg"
@@ -27,6 +31,10 @@ type Client struct {
 	BrowserDriverDir string
 	Timeout          int
 	BrowserAutoFill  bool
+	// Browser profile directory, reused between logins
+	BrowserProfileDir string
+	// Seconds to wait for browser policy after creating a new profile
+	BrowserPolicyWarmup int
 }
 
 // New create new browser based client
@@ -38,6 +46,8 @@ func New(idpAccount *cfg.IDPAccount) (*Client, error) {
 		BrowserExecutablePath: idpAccount.BrowserExecutablePath,
 		Timeout:               idpAccount.Timeout,
 		BrowserAutoFill:       idpAccount.BrowserAutoFill,
+		BrowserProfileDir:     idpAccount.BrowserProfileDir,
+		BrowserPolicyWarmup:   idpAccount.BrowserPolicyWarmup,
 	}, nil
 }
 
@@ -71,7 +81,7 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	}
 
 	// TODO: provide some overrides for this window
-	launchOptions := playwright.BrowserTypeLaunchOptions{
+	launchOptions := playwright.BrowserTypeLaunchPersistentContextOptions{
 		Headless: playwright.Bool(cl.Headless),
 	}
 
@@ -102,35 +112,40 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		launchOptions.ExecutablePath = &cl.BrowserExecutablePath
 	}
 
-	// currently using the main browsers supported by Playwright: Chromium, Firefox or Webkit
-	//
-	// this is a sandboxed browser window so password managers and addons are separate
-	browser, err := browserType.Launch(launchOptions)
-	if err != nil {
-		return "", err
-	}
-
-	// create Context Optionsf
-	contextOptions := playwright.BrowserNewContextOptions{}
-
-	// load saved storageState if present and add to contextOptions
 	userHomeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
 	storageStatePath := fmt.Sprintf("%s/.aws/saml2aws/storageState.json", userHomeDir)
+
+	profileDir := filepath.Join(userHomeDir, ".aws", "saml2aws", "browser-profile")
+	if cl.BrowserProfileDir != "" {
+		if profileDir, err = homedir.Expand(cl.BrowserProfileDir); err != nil {
+			return "", err
+		}
+	}
+	warmup := time.Duration(cl.BrowserPolicyWarmup) * time.Second
+
+	context, cleanup, err := launchPersistentContext(browserType, launchOptions, profileDir, warmup)
 	if err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(storageStatePath); err == nil {
-		contextOptions.StorageStatePath = playwright.String(storageStatePath)
+
+	// Persistent contexts can't take a storageState option, so restore the
+	// saved cookies explicitly.
+	if cookies, err := loadStorageStateCookies(storageStatePath); err != nil {
+		logger.Info("Error loading storage state", err)
+	} else if len(cookies) > 0 {
+		if err := context.AddCookies(cookies); err != nil {
+			logger.Info("Error restoring storage state cookies", err)
+		}
 	}
 
-	// Create new broswer context
-	context, err := browser.NewContext(contextOptions)
-	if err != nil {
-		return "", err
-	}
-
-	page, err := context.NewPage()
-	if err != nil {
+	var page playwright.Page
+	if pages := context.Pages(); len(pages) > 0 {
+		page = pages[0]
+	} else if page, err = context.NewPage(); err != nil {
+		cleanup()
 		return "", err
 	}
 
@@ -141,18 +156,81 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 			logger.Info("Error saving storage state", err)
 		}
 		logger.Info("clean up browser")
-		if err := context.Close(); err != nil {
-			logger.Info("Error when closing context", err)
-		}
-		if err := browser.Close(); err != nil {
-			logger.Info("Error when closing browser", err)
-		}
+		cleanup()
 		if err := pw.Stop(); err != nil {
 			logger.Info("Error when stopping pm", err)
 		}
 	}()
 
 	return getSAMLResponse(page, loginDetails, cl)
+}
+
+// launchPersistentContext launches the browser into the default context of
+// profileDir rather than via browser.NewContext(): Playwright creates new
+// contexts off-the-record, and Chrome disables Enterprise Connectors (Device
+// Trust) there, so IdPs that check device posture through Chrome Device
+// Trust see no device signals. If profileDir is held by another login, a
+// throwaway profile is used instead.
+//
+// A newly created profile waits for warmup before returning. Managed Chrome
+// fetches its cloud policy (which turns on Device Trust) a few seconds after
+// starting with an empty profile, and an IdP redirect that arrives first gets
+// no device signals. Reused profiles start with the cached policy.
+//
+// The returned cleanup closes the context and removes any throwaway profile.
+func launchPersistentContext(browserType playwright.BrowserType, options playwright.BrowserTypeLaunchPersistentContextOptions, profileDir string, warmup time.Duration) (playwright.BrowserContext, func(), error) {
+	_, statErr := os.Stat(profileDir)
+	fresh := errors.Is(statErr, os.ErrNotExist)
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		return nil, nil, err
+	}
+	context, err := browserType.LaunchPersistentContext(profileDir, options)
+	removeDir := ""
+	if err != nil {
+		logger.Info(fmt.Sprintf("browser profile %s unavailable (%v); using a throwaway profile", profileDir, err))
+		if removeDir, err = os.MkdirTemp("", "saml2aws-browser-"); err != nil {
+			return nil, nil, err
+		}
+		if context, err = browserType.LaunchPersistentContext(removeDir, options); err != nil {
+			_ = os.RemoveAll(removeDir)
+			return nil, nil, err
+		}
+		fresh = true
+	}
+	if fresh && warmup > 0 {
+		logger.Info(fmt.Sprintf("new browser profile; waiting %s for browser policy", warmup))
+		time.Sleep(warmup)
+	}
+	cleanup := func() {
+		if err := context.Close(); err != nil {
+			logger.Info("Error when closing context", err)
+		}
+		if removeDir != "" {
+			if err := os.RemoveAll(removeDir); err != nil {
+				logger.Info("Error removing browser profile", err)
+			}
+		}
+	}
+	return context, cleanup, nil
+}
+
+// loadStorageStateCookies reads the cookies from a Playwright storageState
+// file. A missing file is not an error.
+func loadStorageStateCookies(path string) ([]playwright.OptionalCookie, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var state struct {
+		Cookies []playwright.OptionalCookie `json:"cookies"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+	return state.Cookies, nil
 }
 
 var getSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDetails, client *Client) (string, error) {

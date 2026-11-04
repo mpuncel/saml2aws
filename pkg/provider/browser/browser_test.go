@@ -237,3 +237,26 @@ func TestAutoFill(t *testing.T) {
 		assert.Equal(t, "golang:gopher", result)
 	}
 }
+
+func TestLoadStorageStateCookies(t *testing.T) {
+	dir := t.TempDir()
+
+	cookies, err := loadStorageStateCookies(dir + "/missing.json")
+	require.NoError(t, err)
+	assert.Empty(t, cookies)
+
+	path := dir + "/storageState.json"
+	require.NoError(t, os.WriteFile(path, []byte(`{"cookies":[{"name":"sid","value":"abc","domain":"login.example.com","path":"/","expires":-1,"httpOnly":true,"secure":true,"sameSite":"Lax"}],"origins":[]}`), 0o600))
+	cookies, err = loadStorageStateCookies(path)
+	require.NoError(t, err)
+	require.Len(t, cookies, 1)
+	assert.Equal(t, "sid", cookies[0].Name)
+	assert.Equal(t, "abc", cookies[0].Value)
+	assert.Equal(t, "login.example.com", *cookies[0].Domain)
+	assert.True(t, *cookies[0].HttpOnly)
+	assert.Equal(t, playwright.SameSiteAttributeLax, cookies[0].SameSite)
+
+	require.NoError(t, os.WriteFile(path, []byte(`not json`), 0o600))
+	_, err = loadStorageStateCookies(path)
+	assert.Error(t, err)
+}
