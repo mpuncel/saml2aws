@@ -579,6 +579,23 @@ To install the drivers, you can:
 * Set in your shell environment `SAML2AWS_AUTO_BROWSER_DOWNLOAD=true`
 * Set `download_browser_driver = true` in your saml2aws config file, i.e. `~/.saml2aws`
 
+### Browser Profile for Browser IDP
+
+The Browser Identity Provider runs the browser with a dedicated profile at `~/.aws/saml2aws/browser-profile`, which is
+reused between logins. It is separate from your everyday browser profile, so password managers and extensions are not
+shared. A regular profile is used rather than an incognito-style one because Chrome turns off Enterprise Connectors,
+such as Chrome Device Trust, in off-the-record contexts, and IdPs that check device posture then see no device
+signals. If the profile is already in use by another `saml2aws login`, a temporary profile is used for that login
+instead.
+
+* Set `browser_profile_dir` in your saml2aws config file, pass `--browser-profile-dir`, or set
+  `SAML2AWS_BROWSER_PROFILE_DIR` to use a different profile directory.
+* Device Trust needs an installed, managed Chrome (`browser_type = chrome`); the bundled Chromium is not managed. A new
+  profile needs a few seconds to fetch its cloud policy before Device Trust is turned on. Set
+  `browser_policy_warmup = 15` in your saml2aws config file, pass `--browser-policy-warmup=15`, or set
+  `SAML2AWS_BROWSER_POLICY_WARMUP=15` to wait that many seconds before loading the IdP when a profile is created. Later
+  logins reuse the profile and do not wait.
+
 ## Advanced Configuration (Multiple AWS account access but SAML authenticate against a single 'SSO' AWS account)
 
 Example:
